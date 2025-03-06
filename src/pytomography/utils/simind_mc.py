@@ -246,6 +246,10 @@ def run_scatter_simulation(
     Returns:
         _type_: _description_
     """
+    
+    n_batches = 10
+    
+    
     temp_dir = tempfile.TemporaryDirectory()
     # Create window file
     with open(os.path.join(temp_dir.name, 'simind.win'), 'w') as f:
@@ -253,7 +257,7 @@ def run_scatter_simulation(
     # Radial positions
     np.savetxt(os.path.join(temp_dir.name, f'radii_corfile.cor'), proj_meta.radii)
     # update number of events per parallel simulation
-    simind_index_dict.update({'NN':n_events/n_parallel/1e6})
+    simind_index_dict.update({'NN':n_events/n_parallel/n_batches/1e6})
     # Save attenuation map and source map to TEMP directory
     save_attenuation_map(attenuation_map_140keV, object_meta.dr[0], temp_dir.name)
     save_source_map(source_map, temp_dir.name)
@@ -263,16 +267,17 @@ def run_scatter_simulation(
     p = subprocess.Popen(['cp', smc_filepath, f'{temp_dir.name}/simind.smc']) 
     p.wait() # wait for copy to complete
     # Create simind commands and run simind in parallel
-    simind_commands = [create_simind_command(simind_index_dict, i) for i in range(n_parallel)]
-    procs = [subprocess.Popen([f'simind', 'simind', simind_command, 'radii_corfile.cor'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=temp_dir.name) for simind_command in simind_commands]
-    for p in procs:
-        p.wait()
-        if p.returncode != 0:  # Check if the process exited with an error
-            error_output = p.stderr.read().decode('utf-8')
-            print(f"Error in process {p.args}:\n{error_output}")
-    time.sleep(0.1) # sometimes the last file is not written yet
+    simind_commands = [create_simind_command(simind_index_dict, i) for i in range(n_parallel*n_batches)]
+    for batchIdx in range(n_batches):
+        n0, n1 = batchIdx * n_parallel, (batchIdx + 1) * n_parallel
+        procs = [subprocess.Popen([f'simind', 'simind', simind_command, 'radii_corfile.cor'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=temp_dir.name) for simind_command in simind_commands[n0:n1]]
+        for p in procs:
+            p.wait()
+            if p.returncode != 0:  # Check if the process exited with an error
+                error_output = p.stderr.read().decode('utf-8')
+                print(f"Error in process {p.args}:\n{error_output}")
     # Add together projection data from all seperate processes
-    add_together(n_parallel, len(energy_window_params), temp_dir.name)
+    add_together(n_parallel*n_batches, len(energy_window_params), temp_dir.name)
     proj_simind_scatter = simind.get_projections([f'{temp_dir.name}/sca_w{i+1}.h00' for i in range(len(energy_window_params))])
     proj_simind_tot = simind.get_projections([f'{temp_dir.name}/tot_w{i+1}.h00' for i in range(len(energy_window_params))])
     # if length of energy window params is 1 then we need to unsqueeze
@@ -401,7 +406,8 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         attenuation_map_140keV,
         energy_window_params,
         primary_window_idx,
-        isotope_name,
+        isotope_names,
+        isotope_ratios,
         collimator_type,
         crystal_thickness,
         cover_thickness,
@@ -420,7 +426,8 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         )
         self.attenuation_map_140keV = attenuation_map_140keV
         self.energy_window_params = energy_window_params
-        self.isotope_name = isotope_name
+        self.isotope_names = isotope_names
+        self.isotope_ratios = isotope_ratios
         self.collimator_type = collimator_type
         self.cover_thickness = cover_thickness
         self.crystal_thickness = crystal_thickness  
@@ -433,7 +440,6 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         
     def _get_proj_meta_subset(self, subset_idx):
         indices_array = self.subset_indices_array[subset_idx]
-        print(indices_array)
         proj_meta_new = copy(self.proj_meta)
         proj_meta_new.angles = proj_meta_new.angles[indices_array]
         proj_meta_new.radii = proj_meta_new.radii[indices_array.cpu().numpy()]
@@ -448,30 +454,32 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
             proj_meta = self._get_proj_meta_subset(subset_idx)
         else:
             proj_meta = self.proj_meta
-        index_dict = get_simind_params_from_metadata(self.object_meta, proj_meta)
-        index_dict.update(get_simind_isotope_detector_params(
-            isotope_name = self.isotope_name,
-            collimator_type= self.collimator_type,
-            crystal_thickness=self.crystal_thickness,
-            cover_thickness=self.cover_thickness,
-            backscatter_thickness=self.backscatter_thickness,
-            energy_resolution_140keV=self.energy_resolution_140keV
-        ))
-        if self.advanced_collimator_modeling:
-            index_dict.update({'53':'1','59':'1'})
-        projections = run_scatter_simulation(
-            object,
-            self.attenuation_map_140keV,
-            self.object_meta,
-            proj_meta,
-            self.energy_window_params,
-            index_dict,
-            self.n_events,
-            self.n_parallel,
-            return_total=True,
-        )[self.primary_window_idx]
-        projections = projections * object.sum()
-        return projections
+        projections_total = 0
+        for isotope_name, isotope_ratio in zip(self.isotope_names, self.isotope_ratios):
+            index_dict = get_simind_params_from_metadata(self.object_meta, proj_meta)
+            index_dict.update(get_simind_isotope_detector_params(
+                isotope_name = isotope_name,
+                collimator_type= self.collimator_type,
+                crystal_thickness=self.crystal_thickness,
+                cover_thickness=self.cover_thickness,
+                backscatter_thickness=self.backscatter_thickness,
+                energy_resolution_140keV=self.energy_resolution_140keV
+            ))
+            if self.advanced_collimator_modeling:
+                index_dict.update({'53':'1','59':'1'})
+            projections = run_scatter_simulation(
+                object,
+                self.attenuation_map_140keV,
+                self.object_meta,
+                proj_meta,
+                self.energy_window_params,
+                index_dict,
+                self.n_events,
+                self.n_parallel,
+                return_total=True,
+            )[self.primary_window_idx]
+            projections_total += projections * object.sum() * isotope_ratio
+        return projections_total
         
 class MonteCarloHybridSPECTPoissonLogLikelihood(PoissonLogLikelihood):
     def compute_gradient(
@@ -483,9 +491,9 @@ class MonteCarloHybridSPECTPoissonLogLikelihood(PoissonLogLikelihood):
         proj_subset = self._get_projection_subset(self.projections, subset_idx)
         additive_term_subset = self._get_projection_subset(self.additive_term, subset_idx)
         self.projections_predicted = self.system_matrix.forward(object, subset_idx) + additive_term_subset
-        mask = self.projections_predicted > 0
-        ratio = mask * proj_subset / (self.projections_predicted + pytomography.delta)
-        ratio[ratio>1000] = 1000
-        #norm_BP = self._get_normBP(subset_idx)
-        norm_BP = self.system_matrix.backward(mask, subset_idx)
+        mask_bad = (self.projections_predicted < pytomography.delta)*(proj_subset > pytomography.delta)
+        ratio = ~mask_bad * proj_subset / (self.projections_predicted + pytomography.delta)
+        ratio[ratio>1000] = 1000 # clip to prevent MC noise causing instability
+        norm_BP = self._get_normBP(subset_idx)
+        #norm_BP = self.system_matrix.backward(mask, subset_idx)
         return self.system_matrix.backward(ratio, subset_idx) - norm_BP
