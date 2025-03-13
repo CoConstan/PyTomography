@@ -18,6 +18,8 @@ from pytomography.likelihoods import PoissonLogLikelihood
 import pydicom
 import torch
 
+ENERGY_RESOLUTION_MODELS = ['siemens']
+
 def save_attenuation_map(
     attenuation_map: torch.Tensor,
     dx: float,
@@ -101,7 +103,8 @@ def get_simind_isotope_detector_params(
     cover_thickness: float,
     backscatter_thickness: float,
     crystal_thickness: float,
-    energy_resolution_140keV: float,
+    energy_resolution_140keV: float = 0,
+    advanced_energy_resolution_model: str | None = None,
     advanced_collimator_modeling: bool = False,
     random_collimator_movement: bool = False,
 ) -> dict:
@@ -119,6 +122,11 @@ def get_simind_isotope_detector_params(
     Returns:
         dict: Dictionary of SIMIND parameters obtainable from isotope and detector parameters
     """
+    if advanced_energy_resolution_model is not None:
+        if advanced_energy_resolution_model=='siemens':
+            energy_resolution_140keV = 0
+        else:
+            raise ValueError(f'Advanced energy resolution model {advanced_energy_resolution_model} not recognized.')
     index_dict = {
         'fi': isotope_name,
         'cc': collimator_type,
@@ -129,6 +137,8 @@ def get_simind_isotope_detector_params(
         '11': backscatter_thickness, # TODO: add material as argument, default pyrex
         '09': crystal_thickness
     }
+    if advanced_energy_resolution_model is not None:
+        index_dict['Fe'] = advanced_energy_resolution_model
     return index_dict
 
 def get_energy_window_params_dicom(
@@ -247,8 +257,8 @@ def run_scatter_simulation(
         _type_: _description_
     """
     
-    n_batches = 10
     
+    n_batches = 10
     
     temp_dir = tempfile.TemporaryDirectory()
     # Create window file
@@ -266,6 +276,9 @@ def run_scatter_simulation(
     smc_filepath = os.path.join(module_path, "../data/simind.smc")
     p = subprocess.Popen(['cp', smc_filepath, f'{temp_dir.name}/simind.smc']) 
     p.wait() # wait for copy to complete
+    for energy_res_model in ENERGY_RESOLUTION_MODELS:
+        e_res_filepath = os.path.join(module_path, f"../data/{energy_res_model}.erf")
+        p = subprocess.Popen(['cp', e_res_filepath, f'{temp_dir.name}/{energy_res_model}.erf'])
     # Create simind commands and run simind in parallel
     simind_commands = [create_simind_command(simind_index_dict, i) for i in range(n_parallel*n_batches)]
     for batchIdx in range(n_batches):
@@ -292,115 +305,13 @@ def run_scatter_simulation(
     else:
         return proj_simind_scatter
 
-class MonteCarloScatterCallback(Callback):
-    """Callback used to incorporate Monte Carlo scatter simulation into the reconstruction process
-
-    Args:
-        likelihood (Likelihood): Likelihood used in reconstruction
-        object_initial (torch.Tensor): Initial object used in reconstruction
-        simind_index_dict (dict): SIMIND parameters used for the simulation
-        attenuation_map_140keV (torch.Tensor): Attenuation map at 140keV used for the simulation
-        calibration_factor (float): Calibration factor (in counts per second per MBq) used for the simulation, must match the calibration factor of the collected data
-        energy_window_params (list): List of strings which constitute a typical "scattwin.win" file used by SIMIND
-        primary_window_idxs (list): Indices from the energy_window_params list corresponding to indices used as photopeak in reconstruction. For single photopeak reconstruction, this will be a list of length 1, while for multi-photopeak reconstruction, this will be a list of length > 1.
-        n_events (_type_, optional): Number of events to use in Monte Carlo Scatter simulation. Defaults to 1e6.
-        n_parallel (int, optional): Number of parallel simulation to run. Defaults to 1.
-        run_every_iter (int, optional): How often the scatter should be updated in terms of iterations. Defaults to 1.
-        run_every_subsets (int, optional): How often the scatter should be updated in terms of subsets. Defaults to 1.
-        final_iter (int, optional): Stops updating scatter after this number of iterations. Defaults to np.inf.
-        post_smoothing_sigma_r (float, optional): Smooth scatter estimate in r direction after Monte Carlo simulation (specified in cm). Defaults to 0.
-        post_smoothing_sigma_z (float, optional): Smooth scatter estimate in z direction after Monte Carlo simulation (specified in cm). Defaults to 0.
-    """
-    def __init__(
-        self,
-        likelihood: Likelihood,
-        object_initial: torch.Tensor,
-        simind_index_dict: dict,
-        attenuation_map_140keV: torch.Tensor,
-        calibration_factor: float,
-        energy_window_params: list,
-        primary_window_idx: int,
-        n_events = 1e6,   
-        n_parallel = 1,
-        run_every_iter = 1,
-        run_every_subsets = 1,
-        final_iter: int = np.inf, # when to stop updating scatter
-        post_smoothing_sigma_r: float = 0,
-        post_smoothing_sigma_z: float = 0,
-        return_total: bool = False,
-        add_to_additive_term: bool = False
-    ):
-        self.likelihood = likelihood
-        self.object_initial = object_initial
-        self.index_dict = simind_index_dict
-        self.attenuation_map_140keV = attenuation_map_140keV
-        self.calibration_factor = calibration_factor
-        self.energy_window_params = energy_window_params
-        self.primary_window_idx = primary_window_idx
-        self.n_events = n_events
-        self.n_parallel = n_parallel
-        self.run_every_iter = run_every_iter
-        self.run_every_subsets = run_every_subsets
-        self.final_iter = final_iter
-        self.post_smoothing_sigma_r = post_smoothing_sigma_r
-        self.post_smoothing_sigma_z = post_smoothing_sigma_z
-        self.add_to_additive_term = add_to_additive_term
-        self.return_total = return_total
-        self.run_scatter_simulation(object_initial)
-        
-    def run_scatter_simulation(self, object: torch.Tensor):
-        """Runs the Monte Carlo scatter simulation given the reconstruction update ``object``
-
-        Args:
-            object (torch.Tensor): Reconstruction updated image estimate
-        """
-        self.scatter_MC = run_scatter_simulation(
-            source_map = object,
-            attenuation_map_140keV = self.attenuation_map_140keV,
-            object_meta = self.likelihood.system_matrix.object_meta,
-            proj_meta = self.likelihood.system_matrix.proj_meta,
-            energy_window_params=self.energy_window_params,
-            simind_index_dict = self.index_dict,
-            n_events = self.n_events,   
-            n_parallel = self.n_parallel,
-            return_total = self.return_total
-        )[primary_window_idx] / self.calibration_factor * object.sum()
-        # Smooth scatter if sigmas are given
-        self.scatter_MC = get_smoothed_scatter(
-            scatter = self.scatter_MC,
-            proj_meta = self.likelihood.system_matrix.proj_meta,
-            sigma_r = self.post_smoothing_sigma_r,
-            sigma_z = self.post_smoothing_sigma_z
-        )
-        # Update likelihood
-        if self.add_to_additive_term:
-            self.likelihood.additive_term += self.scatter_MC
-        else:
-            self.likelihood.additive_term = self.scatter_MC
-        #print(f'Object sum: {object.sum().item()}')
-        #print(f'Scatter sum: {self.scatter_MC.sum().item()}')
-        #print('-----------------------------------')
-        
-    def run(self, object: torch.Tensor, n_iter: int, n_subset: int) -> torch.Tensor:
-        """Runs the callback
-
-        Args:
-            object (torch.Tensor): Current image estimate
-            n_iter (int): Iteration number
-            n_subset (int): Subset number
-
-        Returns:
-            torch.Tensor: Updated object (not updated in this case)
-        """
-        if ((n_iter+1) % self.run_every_iter == 0) * ((n_iter+1) < self.final_iter) * ((n_subset+1) % self.run_every_subsets == 0):
-            self.run_scatter_simulation(object)
-        return object
-
 class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
     def __init__(
         self,
         object_meta,
         proj_meta,
+        n_events,
+        n_parallel,
         obj2obj_transforms,
         proj2proj_transforms,
         attenuation_map_140keV,
@@ -412,10 +323,9 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         crystal_thickness,
         cover_thickness,
         backscatter_thickness,
-        energy_resolution_140keV,
-        advanced_collimator_modeling,
-        n_events,
-        n_parallel
+        energy_resolution_140keV: float = 0,
+        advanced_energy_resolution_model: str | None = None,
+        advanced_collimator_modeling = False,
     ):
         super().__init__(
             obj2obj_transforms,
@@ -433,6 +343,7 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         self.crystal_thickness = crystal_thickness  
         self.backscatter_thickness = backscatter_thickness
         self.energy_resolution_140keV = energy_resolution_140keV
+        self.advanced_energy_resolution_model = advanced_energy_resolution_model
         self.advanced_collimator_modeling = advanced_collimator_modeling
         self.primary_window_idx = primary_window_idx
         self.n_events = n_events
@@ -463,10 +374,10 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
                 crystal_thickness=self.crystal_thickness,
                 cover_thickness=self.cover_thickness,
                 backscatter_thickness=self.backscatter_thickness,
-                energy_resolution_140keV=self.energy_resolution_140keV
+                energy_resolution_140keV=self.energy_resolution_140keV,
+                advanced_energy_resolution_model=self.advanced_energy_resolution_model,
+                advanced_collimator_modeling=self.advanced_collimator_modeling
             ))
-            if self.advanced_collimator_modeling:
-                index_dict.update({'53':'1','59':'1'})
             projections = run_scatter_simulation(
                 object,
                 self.attenuation_map_140keV,
