@@ -258,7 +258,7 @@ def run_scatter_simulation(
     """
     
     
-    n_batches = 10
+    n_batches = 5
     
     temp_dir = tempfile.TemporaryDirectory()
     # Create window file

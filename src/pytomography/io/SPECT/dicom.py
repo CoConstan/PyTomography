@@ -861,7 +861,10 @@ def save_dcm(
     for attr in ['StudyDate', 'StudyTime', 'SeriesDate', 'SeriesTime', 'AcquisitionDate', 'AcquisitionTime', 'ContentDate', 'ContentTime', 'PatientSex', 'PatientAge', 'Manufacturer', 'PatientWeight', 'PatientHeight']:
         if hasattr(ds_NM, attr):
             ds[attr] = ds_NM[attr]
-    ds.SeriesDescription = f'{ds_NM.SeriesDescription}: {recon_name}'
+    try:
+        ds.SeriesDescription = f'{ds_NM.SeriesDescription}: {recon_name}'
+    except:
+        None
     # Create all slices
     if not single_dicom_file:
         dss = []
