@@ -17,6 +17,10 @@ from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.likelihoods import PoissonLogLikelihood
 import pydicom
 import torch
+from pytomography.projectors import SystemMatrix
+from pytomography.transforms import Transform
+from pytomography.utils.spatial import pad_proj
+from collections.abc import Callable
 
 ENERGY_RESOLUTION_MODELS = ['siemens']
 
@@ -39,7 +43,8 @@ def save_attenuation_map(
 def save_source_map(
     source_map: torch.Tensor,
     temp_path: str,
-    vmax: float = 1.0e6
+    scaling: float,
+    vmax: float = 1e6
 ):
     """Save source map as binary file to temporary directory for subsequent use by Monte Carlo scatter simulation.
 
@@ -50,7 +55,7 @@ def save_source_map(
     """
     source_map = source_map.clamp(0, vmax)
     d = source_map.cpu().numpy().astype(np.float32)
-    d *= 1e6 / d.sum()
+    d *= scaling / d.sum()
     d_flat = d.swapaxes(0,2).ravel()
     d_flat.tofile(os.path.join(temp_path, f'source_act_av.bin'))
 
@@ -257,8 +262,7 @@ def run_scatter_simulation(
         _type_: _description_
     """
     
-    
-    n_batches = 5
+    n_batches = 1
     
     temp_dir = tempfile.TemporaryDirectory()
     # Create window file
@@ -266,11 +270,9 @@ def run_scatter_simulation(
         f.write('\n'.join(energy_window_params))
     # Radial positions
     np.savetxt(os.path.join(temp_dir.name, f'radii_corfile.cor'), proj_meta.radii)
-    # update number of events per parallel simulation
-    simind_index_dict.update({'NN':n_events/n_parallel/n_batches/1e6})
     # Save attenuation map and source map to TEMP directory
     save_attenuation_map(attenuation_map_140keV, object_meta.dr[0], temp_dir.name)
-    save_source_map(source_map, temp_dir.name)
+    save_source_map(source_map, temp_dir.name, scaling=n_events/n_parallel/n_batches)
     # Move simind.smc and energy_resolution.erf to TEMP directory
     module_path = os.path.dirname(os.path.abspath(__file__))
     smc_filepath = os.path.join(module_path, "../data/simind.smc")
@@ -304,6 +306,51 @@ def run_scatter_simulation(
         return proj_simind_tot
     else:
         return proj_simind_scatter
+    
+class AdditiveTermTransform(Transform):
+    def __init__(self, additive_term):
+        super(AdditiveTermTransform, self).__init__()
+        self.additive_term = additive_term
+    @torch.no_grad()
+    def forward(
+		self,
+		proj: torch.Tensor,
+        padded: bool = True,
+	) -> torch.tensor:
+        return proj + self.additive_term
+    @torch.no_grad()
+    def backward(
+		self,
+		proj: torch.Tensor,
+        padded: bool = True,
+	) -> torch.tensor:
+        return proj # DON'T ADD HERE
+    
+class CutOffTransform(Transform):
+    def __init__(self, mask):
+        super(CutOffTransform, self).__init__()
+        self.padded_mask = pad_proj(mask)
+        self.mask = mask
+    @torch.no_grad()
+    def forward(
+		self,
+		proj: torch.Tensor,
+        padded: bool = True,
+	) -> torch.tensor:
+        if padded:
+            return proj * self.padded_mask
+        else:
+            return proj * self.mask
+    @torch.no_grad()
+    def backward(
+		self,
+		proj: torch.Tensor,
+        padded: bool = True,
+	) -> torch.tensor:
+        if padded:
+            return proj * self.padded_mask
+        else:
+            return proj * self.mask
 
 class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
     def __init__(
@@ -390,6 +437,9 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
                 return_total=True,
             )[self.primary_window_idx]
             projections_total += projections * object.sum() * isotope_ratio
+        # still apply proj2proj transforms since these are only additive term and cutoff
+        for transform in self.proj2proj_transforms:
+            projections_total = transform.forward(projections_total, padded=False)
         return projections_total
         
 class MonteCarloHybridSPECTPoissonLogLikelihood(PoissonLogLikelihood):
@@ -403,8 +453,13 @@ class MonteCarloHybridSPECTPoissonLogLikelihood(PoissonLogLikelihood):
         additive_term_subset = self._get_projection_subset(self.additive_term, subset_idx)
         self.projections_predicted = self.system_matrix.forward(object, subset_idx) + additive_term_subset
         mask_bad = (self.projections_predicted < pytomography.delta)*(proj_subset > pytomography.delta)
-        ratio = ~mask_bad * proj_subset / (self.projections_predicted + pytomography.delta)
+        ratio = (~mask_bad * proj_subset + pytomography.delta) / (self.projections_predicted + pytomography.delta)
         ratio[ratio>1000] = 1000 # clip to prevent MC noise causing instability
         norm_BP = self._get_normBP(subset_idx)
+        # Look for AdditiveTermTransform in System Matrix proj2proj transforms and update self.additive_term within that transform if estimate_background is true
+        for transform in self.system_matrix.proj2proj_transforms:
+            if isinstance(transform, AdditiveTermTransform):
+                transform.additive_term = transform.additive_term * ratio.sum() / (ratio*0+1).sum() 
+                print(f'Updated additive term to {transform.additive_term}')
         #norm_BP = self.system_matrix.backward(mask, subset_idx)
         return self.system_matrix.backward(ratio, subset_idx) - norm_BP
