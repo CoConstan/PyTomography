@@ -243,7 +243,7 @@ def run_scatter_simulation(
     n_events: int,
     n_parallel: int = 1,
     return_total: bool = False
-):
+) -> torch.Tensor:
     """Runs a Monte Carlo scatter simulation using SIMIND
 
     Args:
@@ -259,7 +259,7 @@ def run_scatter_simulation(
         return_total (bool, optional): Whether or not to also return the total projections. Defaults to False.
 
     Returns:
-        _type_: _description_
+        torch.Tensor: Simulated projections
     """
     
     n_batches = 1
@@ -308,7 +308,11 @@ def run_scatter_simulation(
         return proj_simind_scatter
     
 class AdditiveTermTransform(Transform):
-    def __init__(self, additive_term):
+    def __init__(self, additive_term: float):
+        """Transform that adds an additive term to the projection data. This is used to add the scatter and total projections together.
+        Args:
+            additive_term (float): Additive term to add to the projection data
+        """
         super(AdditiveTermTransform, self).__init__()
         self.additive_term = additive_term
     @torch.no_grad()
@@ -317,6 +321,13 @@ class AdditiveTermTransform(Transform):
 		proj: torch.Tensor,
         padded: bool = True,
 	) -> torch.tensor:
+        """Adds an additive term to the projection data.
+        Args:
+            proj (torch.Tensor): Projection data
+            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
+        Returns:
+            torch.Tensor: Projection data with additive term added
+        """
         return proj + self.additive_term
     @torch.no_grad()
     def backward(
@@ -324,10 +335,21 @@ class AdditiveTermTransform(Transform):
 		proj: torch.Tensor,
         padded: bool = True,
 	) -> torch.tensor:
+        """Returns the projection data without the additive term.
+        Args:
+            proj (torch.Tensor): Projection data
+            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
+        Returns:
+            torch.Tensor: Projection data without additive term
+        """
         return proj # DON'T ADD HERE
     
 class CutOffTransform(Transform):
     def __init__(self, mask):
+        """Transform that cuts off the projection data outside of a certain region. This is used to remove the background from the projection data.
+        Args:
+            mask (torch.Tensor): Mask to cut off the projection data
+        """
         super(CutOffTransform, self).__init__()
         self.padded_mask = pad_proj(mask)
         self.mask = mask
@@ -337,6 +359,13 @@ class CutOffTransform(Transform):
 		proj: torch.Tensor,
         padded: bool = True,
 	) -> torch.tensor:
+        """Cuts off the projection data outside of a certain region.
+        Args:
+            proj (torch.Tensor): Projection data
+            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
+        Returns:
+            torch.Tensor: Projection data with cutoff applied
+        """
         if padded:
             return proj * self.padded_mask
         else:
@@ -347,6 +376,12 @@ class CutOffTransform(Transform):
 		proj: torch.Tensor,
         padded: bool = True,
 	) -> torch.tensor:
+        """Returns the projection data without the cutoff.
+        Args:
+            proj (torch.Tensor): Projection data
+            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
+        Returns:
+            torch.Tensor: Projection data without cutoff"""
         if padded:
             return proj * self.padded_mask
         else:
@@ -355,25 +390,46 @@ class CutOffTransform(Transform):
 class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
     def __init__(
         self,
-        object_meta,
-        proj_meta,
-        n_events,
-        n_parallel,
-        obj2obj_transforms,
-        proj2proj_transforms,
-        attenuation_map_140keV,
-        energy_window_params,
-        primary_window_idx,
-        isotope_names,
-        isotope_ratios,
-        collimator_type,
-        crystal_thickness,
-        cover_thickness,
-        backscatter_thickness,
+        object_meta: ObjectMeta,
+        proj_meta: SPECTProjMeta,
+        n_events: int,
+        n_parallel: int,
+        obj2obj_transforms: Sequence[Transform],
+        proj2proj_transforms: Sequence[Transform],
+        attenuation_map_140keV: torch.Tensor,
+        energy_window_params: Sequence[str],
+        primary_window_idx: int,
+        isotope_names: Sequence[str],
+        isotope_ratios: Sequence[float],
+        collimator_type: str,
+        crystal_thickness: float,
+        cover_thickness: float,
+        backscatter_thickness: float,
         energy_resolution_140keV: float = 0,
         advanced_energy_resolution_model: str | None = None,
-        advanced_collimator_modeling = False,
+        advanced_collimator_modeling: bool = False,
     ):
+        """Monte Carlo Hybrid SPECT System Matrix class that uses SIMIND to simulate scatter and total projections.
+        Args:
+            object_meta (ObjectMeta): SPECT ObjectMeta used in reconstruction
+            proj_meta (SPECTProjMeta): SPECT projection metadata used in reconstruction
+            n_events (int): Number of photons to simulate per projection angle
+            n_parallel (int): Number of simulations to perform in parallel, should not exceed number of CPU cores.
+            obj2obj_transforms (Sequence[Transform]): List of object to object transforms for back projection
+            proj2proj_transforms (Sequence[Transform]): List of projection to projection transforms for back projection
+            attenuation_map_140keV (torch.Tensor): Attenuation map at 140keV (used in MC simulation)
+            energy_window_params (Sequence[str]): List of strings which constitute a typical "scattwin.win" file used by SIMIND
+            primary_window_idx (int): Index from the energy_window_params list corresponding to indices used as photopeak in reconstruction. For single photopeak reconstruction, this will be a list of length 1, while for multi-photopeak reconstruction, this will be a list of length > 1.
+            isotope_names (Sequence[str]): List of isotope names used in the simulation
+            isotope_ratios (Sequence[float]): Proportion of all isotopes.
+            collimator_type (str): Collimator type used for Monte Carlo scatter simulation (should use SIMIND name).
+            crystal_thickness (float): Crystal thickness used for Monte Carlo scatter simulation (currently assumes NaI)
+            cover_thickness (float): Cover thickness used for simulation. Currently assumes aluminum is used.
+            backscatter_thickness (float): Equivalent backscatter thickness used for simulation. Currently assumes pyrex is used.
+            energy_resolution_140keV (float): Energy resolution in percent of the detector at 140keV. Currently uses the relationship that resolution is proportional to sqrt(E) for E in keV.
+            advanced_energy_resolution_model (str | None, optional): Advanced energy resolution model to use. If provided, then ``energy_resolution_140keV`` is not used. Currently only 'siemens' is supported. Defaults to None.
+            advanced_collimator_modeling (bool, optional): Whether or not to use advanced collimator modeling that can be used to model septal penetration and scatter. Defaults to False.
+        """
         super().__init__(
             obj2obj_transforms,
             proj2proj_transforms,
@@ -396,7 +452,13 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         self.n_events = n_events
         self.n_parallel = n_parallel
         
-    def _get_proj_meta_subset(self, subset_idx):
+    def _get_proj_meta_subset(self, subset_idx: int) -> SPECTProjMeta:
+        """Creates a new SPECTProjMeta that corresponds to a subset of projections
+        Args:
+            subset_idx (int): Index of the subset to use
+        Returns:
+            SPECTProjMeta: New SPECTProjMeta that corresponds to the subset of projections
+        """
         indices_array = self.subset_indices_array[subset_idx]
         proj_meta_new = copy(self.proj_meta)
         proj_meta_new.angles = proj_meta_new.angles[indices_array]
@@ -406,7 +468,14 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         proj_meta_new.num_projections = len(indices_array)
         return proj_meta_new
         
-    def forward(self, object, subset_idx=None):
+    def forward(self, object: torch.Tensor, subset_idx: int | None = None):
+        """Runs the Monte Carlo scatter simulation using SIMIND and returns the simulated projections.
+        Args:
+            object (torch.Tensor): Object to simulate
+            subset_idx (int | None, optional): Index of the subset to use. If None, then all projections are used. Defaults to None.
+        Returns:
+            torch.Tensor: Simulated projections
+        """
         # subsample proj_meta
         if subset_idx is not None:
             proj_meta = self._get_proj_meta_subset(subset_idx)
@@ -443,12 +512,22 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         return projections_total
         
 class MonteCarloHybridSPECTPoissonLogLikelihood(PoissonLogLikelihood):
+    """Adapated Poisson log likelihood for Monte Carlo hybrid SPECT system matrix.
+    """
     def compute_gradient(
         self,
         object: torch.Tensor,
         subset_idx: int | None = None,
         norm_BP_subset_method: str = 'subset_specific'
         ) -> torch.Tensor:
+        """Returns the gradient of the log likelihood with respect to the object.
+        Args:
+            object (torch.Tensor): Object to simulate
+            subset_idx (int | None, optional): Index of the subset to use. If None, then all projections are used. Defaults to None.
+            norm_BP_subset_method (str, optional): Method to use for normalizing the back projection. Defaults to 'subset_specific'.
+        Returns:
+            torch.Tensor: Gradient of the log likelihood with respect to the object
+        """
         proj_subset = self._get_projection_subset(self.projections, subset_idx)
         additive_term_subset = self._get_projection_subset(self.additive_term, subset_idx)
         self.projections_predicted = self.system_matrix.forward(object, subset_idx) + additive_term_subset

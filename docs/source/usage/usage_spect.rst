@@ -77,7 +77,7 @@ The tutorials below demonstrate some additional use cases for SPECT reconstructi
 
         :material-outlined:`question_mark;4em;sd-text-secondary`
 
-    .. grid-item-card:: Monte Carlo Scatter Correction (Lu-177)
+    .. grid-item-card:: Hybrid Monte Carlo Reconstruction (Simulated data)
         :link: ../notebooks/t_spect_mc
         :link-type: doc
         :link-alt: uncertainty spect
@@ -85,7 +85,7 @@ The tutorials below demonstrate some additional use cases for SPECT reconstructi
 
         :material-outlined:`swipe_right_alt;4em;sd-text-secondary`
 
-    .. grid-item-card:: Monte Carlo Scatter Correction (Er-165)
+    .. grid-item-card:: Hybrid Monte Carlo Reconstruction (Real data)
         :link: ../notebooks/t_spect_mc2
         :link-type: doc
         :link-alt: uncertainty spect 2

@@ -736,8 +736,9 @@ def get_aligned_nifti_mask(
     mask_aligned = affine_transform(mask.transpose((1,0,2))[:,:,::-1], M, output_shape=shape, mode='constant', cval=0, order=1)[:,:,::-1]
     return torch.tensor(mask_aligned>cutoff_value).to(pytomography.device)
 
-def get_FOV_mask_from_projections(file_NM, contraction=1):
-    projections = get_projections(file_NM)
+def get_FOV_mask_from_projections(file_NM, projections=None, contraction=1):
+    if projections is None:
+        projections = get_projections(file_NM)
     dims = len(projections.shape)
     x = projections.sum(dim=tuple([i for i in range(dims-2)]))
     r_valid = (x.sum(dim=1)>0).to(torch.int)
