@@ -7,21 +7,20 @@ from pytomography.metadata.SPECT import SPECTObjectMeta, SPECTProjMeta
 from pytomography.utils import pad_object, unpad_object, pad_proj, unpad_proj, rotate_detector_z
 import numpy as np
 from ..system_matrix import SystemMatrix
-try:
-    import parallelproj
-except:
-    pass
-    #Warning('parallelproj not installed. The SPECTCompleteSystemMatrix class requires parallelproj to be installed.')
+from pytomography.utils import simind_mc
+from copy import copy
+from typing import Sequence
+import shutil
 
 class SPECTSystemMatrix(SystemMatrix):
     r"""System matrix for SPECT imaging implemented using the rotate+sum technique.
     
     Args:
-            obj2obj_transforms (Sequence[Transform]): Sequence of object mappings that occur before forward projection.
-            proj2proj_transforms (Sequence[Transform]): Sequence of proj mappings that occur after forward projection.
-            object_meta (SPECTObjectMeta): SPECT Object metadata.
-            proj_meta (SPECTProjMeta): SPECT projection metadata.
-            object_initial_based_on_camera_path (bool): Whether or not to initialize the object estimate based on the camera path; this sets voxels to zero that are outside the SPECT camera path. Defaults to False.
+        obj2obj_transforms (Sequence[Transform]): Sequence of object mappings that occur before forward projection.
+        proj2proj_transforms (Sequence[Transform]): Sequence of proj mappings that occur after forward projection.
+        object_meta (SPECTObjectMeta): SPECT Object metadata.
+        proj_meta (SPECTProjMeta): SPECT projection metadata.
+        object_initial_based_on_camera_path (bool): Whether or not to initialize the object estimate based on the camera path; this sets voxels to zero that are outside the SPECT camera path. Defaults to False.
     """
     def __init__(
         self,
@@ -200,153 +199,132 @@ class SPECTSystemMatrix(SystemMatrix):
         object = unpad_object(object)
         return object
         
-class SPECTCompleteSystemMatrix(SPECTSystemMatrix):
-    """Class presently under construction. 
-    """
+class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
     def __init__(
         self,
-        object_meta,
-        proj_meta,
-        attenuation_map,
-        psf_kernel,
-        store_system_matrix = None,
-        object_mask = None,
-        projections_mask = None,
-    ) -> None:
-        super(SPECTCompleteSystemMatrix, self).__init__([],[], object_meta, proj_meta)
-        self.dimension_single_proj = (*self.proj_meta.shape, *self.object_meta.shape)
-        self.attenuation_map = attenuation_map
-        self.psf_kernel = psf_kernel
-        self.psf_kernel._configure(object_meta)
-        self.X_obj = self._get_object_positions()
-        self.system_matrices = None
-        if store_system_matrix is not None:
-            self.system_matrix_device = store_system_matrix
-        else:
-            self.system_matrix_device = pytomography.device
-        self.system_matrix_dtype = torch.float16
-        self.origin_amap = -(torch.tensor(object_meta.shape).to(pytomography.device)/2-0.5) * torch.tensor(object_meta.dr).to(pytomography.dtype).to(pytomography.device)
-        self.voxel_size_amap = torch.tensor(object_meta.dr).to(pytomography.dtype).to(pytomography.device)
-        if projections_mask is not None:
-            self.projections_mask = projections_mask
-        else:
-            self.projections_mask = torch.ones(self.proj_meta.shape).to(pytomography.device).to(torch.bool)
-        self.valid_proj_pixel_mask = self.projections_mask.reshape(self.proj_meta.num_projections,-1)
-        if object_mask is not None:
-            self.object_mask = object_mask
-            self.valid_obj_voxel_mask= object_mask.ravel()
-        else:
-            self.object_mask = torch.ones(self.object_meta.shape).to(pytomography.device).to(torch.bool)
-        self.valid_obj_voxel_mask = self.object_mask.ravel()
-        if store_system_matrix is not None:
-            print(self._compute_system_matrix_components(0).to(torch.float16).to(self.system_matrix_device).shape)
-            self.system_matrices = [self._compute_system_matrix_components(i).to(torch.float16).to(self.system_matrix_device) for i in range(self.proj_meta.num_projections)]
-            
-    def _get_object_initial(self, device=None):
-        return self.object_mask.to(pytomography.dtype)
-        
-    def _get_proj_positions(self, idx):
-        Ny = self.proj_meta.shape[1]
-        Nz = self.proj_meta.shape[2]
-        dy = self.proj_meta.dr[0]
-        dz = self.proj_meta.dr[1]
-        angle = (270-self.proj_meta.angles[idx]) * torch.pi / 180
-        radius = self.proj_meta.radii[idx]
-        yv, zv = torch.meshgrid(torch.arange(-Ny/2+0.5, Ny/2+0.5, 1)*dy, torch.arange(-Nz/2+0.5, Nz/2+0.5, 1)*dz, indexing='ij')
-        xv = torch.ones(yv.shape) * radius
-        X = torch.stack([xv,yv,zv], dim=-1).to(pytomography.device)
-        rotation_matrix = torch.tensor([
-                [torch.cos(angle), -torch.sin(angle), 0],
-                [torch.sin(angle), torch.cos(angle), 0],
-                [0, 0, 1]
-            ]).to(pytomography.device)
-        return torch.flatten(torch.matmul(rotation_matrix.unsqueeze(0).unsqueeze(0), X.unsqueeze(-1)).squeeze(), end_dim=-2)
-
-    def _get_object_positions(self):
-        Nx, Ny, Nz = self.object_meta.shape
-        dx, dy, dz = self.object_meta.dr
-        xv, yv, zv = torch.meshgrid(
-            [torch.arange(-Nx/2+0.5, Nx/2+0.5, 1)*dx, torch.arange(-Ny/2+0.5, Ny/2+0.5, 1)*dy, torch.arange(-Nz/2+0.5, Nz/2+0.5, 1)*dz], indexing='ij')
-        X = torch.stack([xv,yv,zv], dim=-1).to(pytomography.device)
-        return torch.flatten(X, end_dim=-2)
-        
-    def _compute_system_matrix_components(self, idx):
-        if self.system_matrices is not None:
-            return self.system_matrices[idx].to(self.system_matrix_dtype)
-        valid_proj_idx = self.valid_proj_pixel_mask[idx]
-        valid_obj_idx = self.valid_obj_voxel_mask
-        X_proj = self._get_proj_positions(idx)[valid_proj_idx]
-        X_obj = self.X_obj[valid_obj_idx]
-        # Assume 0 contribution outside of valid regions (requires cropping object initial and projection data)
-        system_matrix_proj_i = torch.einsum(
-            'i,j->ij',
-            torch.ones(valid_proj_idx.sum()).to(pytomography.device),
-            torch.ones(valid_obj_idx.sum()).to(pytomography.device)
+        object_meta: SPECTObjectMeta,
+        proj_meta: SPECTProjMeta,
+        n_events: int,
+        n_parallel: int,
+        obj2obj_transforms: Sequence[Transform],
+        proj2proj_transforms: Sequence[Transform],
+        attenuation_map_140keV: torch.Tensor,
+        energy_window_params: Sequence[str],
+        primary_window_idx: int,
+        isotope_names: Sequence[str],
+        isotope_ratios: Sequence[float],
+        collimator_type: str,
+        crystal_thickness: float,
+        cover_thickness: float,
+        backscatter_thickness: float,
+        energy_resolution_140keV: float = 0,
+        advanced_energy_resolution_model: str | None = None,
+        advanced_collimator_modeling: bool = False,
+    ):
+        """Monte Carlo Hybrid SPECT System Matrix class that uses SIMIND to simulate scatter and total projections.
+        Args:
+            object_meta (ObjectMeta): SPECT ObjectMeta used in reconstruction
+            proj_meta (SPECTProjMeta): SPECT projection metadata used in reconstruction
+            n_events (int): Number of photons to simulate per projection angle
+            n_parallel (int): Number of simulations to perform in parallel, should not exceed number of CPU cores.
+            obj2obj_transforms (Sequence[Transform]): List of object to object transforms for back projection
+            proj2proj_transforms (Sequence[Transform]): List of projection to projection transforms for back projection
+            attenuation_map_140keV (torch.Tensor): Attenuation map at 140keV (used in MC simulation)
+            energy_window_params (Sequence[str]): List of strings which constitute a typical "scattwin.win" file used by SIMIND
+            primary_window_idx (int): Index from the energy_window_params list corresponding to indices used as photopeak in reconstruction. For single photopeak reconstruction, this will be a list of length 1, while for multi-photopeak reconstruction, this will be a list of length > 1.
+            isotope_names (Sequence[str]): List of isotope names used in the simulation
+            isotope_ratios (Sequence[float]): Proportion of all isotopes.
+            collimator_type (str): Collimator type used for Monte Carlo scatter simulation (should use SIMIND name).
+            crystal_thickness (float): Crystal thickness used for Monte Carlo scatter simulation (currently assumes NaI)
+            cover_thickness (float): Cover thickness used for simulation. Currently assumes aluminum is used.
+            backscatter_thickness (float): Equivalent backscatter thickness used for simulation. Currently assumes pyrex is used.
+            energy_resolution_140keV (float): Energy resolution in percent of the detector at 140keV. Currently uses the relationship that resolution is proportional to sqrt(E) for E in keV.
+            advanced_energy_resolution_model (str | None, optional): Advanced energy resolution model to use. If provided, then ``energy_resolution_140keV`` is not used. Currently only 'siemens' is supported. Defaults to None.
+            advanced_collimator_modeling (bool, optional): Whether or not to use advanced collimator modeling that can be used to model septal penetration and scatter. Defaults to False.
+        """
+        # check if "simind" is PATH variable and if not raise error
+        if not shutil.which("simind"):
+            raise RuntimeError(
+                "SIMIND is not in PATH. You need to install SIMIND to use this projector."
+            )
+        super().__init__(
+            obj2obj_transforms,
+            proj2proj_transforms,
+            object_meta,
+            proj_meta,
+            object_initial_based_on_camera_path=True,
         )
-        angle = (270-self.proj_meta.angles[idx]) * torch.pi / 180
-        N_splits = 64
-        # PSF
-        for X_proj_sub, indices in zip(torch.tensor_split(X_proj, N_splits), torch.tensor_split(torch.arange(X_proj.shape[0]).to(pytomography.device), N_splits)):
-            delta_r = (X_proj_sub[:,None] - X_obj)
-            d = torch.abs(delta_r[:,:,0]*torch.cos(angle) + delta_r[:,:,1]*torch.sin(angle))
-            x = delta_r[:,:,1]*torch.cos(angle) - delta_r[:,:,0]*torch.sin(angle)
-            y = delta_r[:,:,2]
-            system_matrix_proj_i[indices] *= self.psf_kernel(x.ravel(),y.ravel(),d.ravel()).reshape(x.shape)
-        # Attenuation
-        for X_proj_sub, indices in zip(torch.tensor_split(X_proj, N_splits), torch.tensor_split(torch.arange(X_proj.shape[0]).to(pytomography.device), N_splits)):
-            X_start = X_obj[None].repeat((X_proj_sub.shape[0],1,1))
-            X_end = X_proj_sub[:,None].repeat((1,X_obj.shape[0],1))
-            system_matrix_proj_i[indices] *= torch.exp(-parallelproj.joseph3d_fwd(
-                torch.flatten(X_start, end_dim=-2),
-                torch.flatten(X_end, end_dim=-2),
-                self.attenuation_map,
-                self.origin_amap,
-                self.voxel_size_amap # TODO: adjust for CT,
-            )).reshape(X_proj_sub.shape[0], X_obj.shape[0])
-        return system_matrix_proj_i.to(torch.float16)
+        self.attenuation_map_140keV = attenuation_map_140keV
+        self.energy_window_params = energy_window_params
+        self.isotope_names = isotope_names
+        self.isotope_ratios = isotope_ratios
+        self.collimator_type = collimator_type
+        self.cover_thickness = cover_thickness
+        self.crystal_thickness = crystal_thickness  
+        self.backscatter_thickness = backscatter_thickness
+        self.energy_resolution_140keV = energy_resolution_140keV
+        self.advanced_energy_resolution_model = advanced_energy_resolution_model
+        self.advanced_collimator_modeling = advanced_collimator_modeling
+        self.primary_window_idx = primary_window_idx
+        self.n_events = n_events
+        self.n_parallel = n_parallel
         
-    def compute_normalization_factor(self, subset_idx : int | None = None) -> torch.tensor:
-        norm_proj = self.projections_mask.to(self.system_matrix_dtype)
+    def _get_proj_meta_subset(self, subset_idx: int) -> SPECTProjMeta:
+        """Creates a new SPECTProjMeta that corresponds to a subset of projections
+        Args:
+            subset_idx (int): Index of the subset to use
+        Returns:
+            SPECTProjMeta: New SPECTProjMeta that corresponds to the subset of projections
+        """
+        indices_array = self.subset_indices_array[subset_idx]
+        proj_meta_new = copy(self.proj_meta)
+        proj_meta_new.angles = proj_meta_new.angles[indices_array]
+        proj_meta_new.radii = proj_meta_new.radii[indices_array.cpu().numpy()]
+        proj_meta_new.shape = (len(indices_array), proj_meta_new.shape[1], proj_meta_new.shape[2])
+        proj_meta_new.padded_shape = (len(indices_array), proj_meta_new.padded_shape[1], proj_meta_new.padded_shape[2])
+        proj_meta_new.num_projections = len(indices_array)
+        return proj_meta_new
+        
+    def forward(self, object: torch.Tensor, subset_idx: int | None = None):
+        """Runs the Monte Carlo scatter simulation using SIMIND and returns the simulated projections.
+        Args:
+            object (torch.Tensor): Object to simulate
+            subset_idx (int | None, optional): Index of the subset to use. If None, then all projections are used. Defaults to None.
+        Returns:
+            torch.Tensor: Simulated projections
+        """
+        # subsample proj_meta
         if subset_idx is not None:
-            norm_proj = norm_proj[self.subset_indices_array[subset_idx]]
-        return self.backward(norm_proj, subset_idx)
-    
-    def forward(
-        self,
-        object,
-        subset_idx: int | None = None
-    ):
-        if subset_idx is not None:
-            angle_subset = self.subset_indices_array[subset_idx]
-        N_angles = self.proj_meta.num_projections if subset_idx is None else len(angle_subset)
-        angle_indices = torch.arange(N_angles) if subset_idx is None else angle_subset
-        proj = torch.zeros(
-            (N_angles,self.proj_meta.shape[1]*self.proj_meta.shape[2])
-            ).to(pytomography.device)
-        for i, idx in enumerate(angle_indices):
-            system_matrix_proj_i = self._compute_system_matrix_components(idx)
-            proj[i,self.valid_proj_pixel_mask[idx]] = torch.einsum(
-                'ij,j->i',
-                system_matrix_proj_i,
-                object.ravel()[self.valid_obj_voxel_mask].to(self.system_matrix_device).to(self.system_matrix_dtype)
-            ).to(pytomography.device).to(pytomography.dtype)
-        return proj.reshape(N_angles,self.proj_meta.shape[1],self.proj_meta.shape[2])
-    
-    def backward(
-        self,
-        proj,
-        subset_idx: int | None = None
-    ):
-        if subset_idx is not None:
-            angle_subset = self.subset_indices_array[subset_idx]
-        N_angles = self.proj_meta.num_projections if subset_idx is None else len(angle_subset)
-        angle_indices = torch.arange(N_angles) if subset_idx is None else angle_subset
-        object = torch.flatten(torch.zeros(*self.object_meta.shape).to(pytomography.device))
-        for i, idx in enumerate(angle_indices):
-            system_matrix_proj_i = self._compute_system_matrix_components(idx)
-            object[self.valid_obj_voxel_mask] += torch.einsum(
-                'ij,i->j',
-                system_matrix_proj_i,
-                proj.flatten(start_dim=1)[i,self.valid_proj_pixel_mask[idx]].to(self.system_matrix_device).to(self.system_matrix_dtype)
-            ).to(pytomography.device).to(pytomography.dtype)
-        return object.reshape(self.object_meta.shape)
+            proj_meta = self._get_proj_meta_subset(subset_idx)
+        else:
+            proj_meta = self.proj_meta
+        projections_total = 0
+        for isotope_name, isotope_ratio in zip(self.isotope_names, self.isotope_ratios):
+            index_dict = simind_mc.get_simind_params_from_metadata(self.object_meta, proj_meta)
+            index_dict.update(simind_mc.get_simind_isotope_detector_params(
+                isotope_name = isotope_name,
+                collimator_type= self.collimator_type,
+                crystal_thickness=self.crystal_thickness,
+                cover_thickness=self.cover_thickness,
+                backscatter_thickness=self.backscatter_thickness,
+                energy_resolution_140keV=self.energy_resolution_140keV,
+                advanced_energy_resolution_model=self.advanced_energy_resolution_model,
+                advanced_collimator_modeling=self.advanced_collimator_modeling
+            ))
+            projections = simind_mc.run_scatter_simulation(
+                object,
+                self.attenuation_map_140keV,
+                self.object_meta,
+                proj_meta,
+                self.energy_window_params,
+                index_dict,
+                self.n_events,
+                self.n_parallel,
+                return_total=True,
+            )[self.primary_window_idx]
+            projections_total += projections * object.sum() * isotope_ratio
+        # still apply proj2proj transforms since these are only additive term and cutoff
+        for transform in self.proj2proj_transforms:
+            projections_total = transform.forward(projections_total, padded=False)
+        return projections_total
+        
