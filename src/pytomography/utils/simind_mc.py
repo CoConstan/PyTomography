@@ -6,21 +6,12 @@ import subprocess
 import tempfile
 from copy import copy
 import numpy as np
-import pytomography
 from pytomography.io.SPECT import dicom, simind
-from pytomography.callbacks import Callback
-from pytomography.likelihoods import Likelihood
 from pytomography.metadata import ObjectMeta
 from pytomography.metadata.SPECT import SPECTProjMeta
-from pytomography.utils.scatter import get_smoothed_scatter
-from pytomography.projectors.SPECT import SPECTSystemMatrix
-from pytomography.likelihoods import PoissonLogLikelihood
 import pydicom
 import torch
-from pytomography.projectors import SystemMatrix
 from pytomography.transforms import Transform
-from pytomography.utils.spatial import pad_proj
-from collections.abc import Callable
 
 ENERGY_RESOLUTION_MODELS = ['siemens']
 
@@ -307,87 +298,6 @@ def run_scatter_simulation(
     else:
         return proj_simind_scatter
     
-class AdditiveTermTransform(Transform):
-    def __init__(self, additive_term: float):
-        """Transform that adds an additive term to the projection data. This is used to add the scatter and total projections together.
-        Args:
-            additive_term (float): Additive term to add to the projection data
-        """
-        super(AdditiveTermTransform, self).__init__()
-        self.additive_term = additive_term
-    @torch.no_grad()
-    def forward(
-		self,
-		proj: torch.Tensor,
-        padded: bool = True,
-	) -> torch.tensor:
-        """Adds an additive term to the projection data.
-        Args:
-            proj (torch.Tensor): Projection data
-            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
-        Returns:
-            torch.Tensor: Projection data with additive term added
-        """
-        return proj + self.additive_term
-    @torch.no_grad()
-    def backward(
-		self,
-		proj: torch.Tensor,
-        padded: bool = True,
-	) -> torch.tensor:
-        """Returns the projection data without the additive term.
-        Args:
-            proj (torch.Tensor): Projection data
-            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
-        Returns:
-            torch.Tensor: Projection data without additive term
-        """
-        return proj # DON'T ADD HERE
-    
-class CutOffTransform(Transform):
-    def __init__(self, mask):
-        """Transform that cuts off the projection data outside of a certain region. This is used to remove the background from the projection data.
-        Args:
-            mask (torch.Tensor): Mask to cut off the projection data
-        """
-        super(CutOffTransform, self).__init__()
-        self.padded_mask = pad_proj(mask)
-        self.mask = mask
-    @torch.no_grad()
-    def forward(
-		self,
-		proj: torch.Tensor,
-        padded: bool = True,
-	) -> torch.tensor:
-        """Cuts off the projection data outside of a certain region.
-        Args:
-            proj (torch.Tensor): Projection data
-            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
-        Returns:
-            torch.Tensor: Projection data with cutoff applied
-        """
-        if padded:
-            return proj * self.padded_mask
-        else:
-            return proj * self.mask
-    @torch.no_grad()
-    def backward(
-		self,
-		proj: torch.Tensor,
-        padded: bool = True,
-	) -> torch.tensor:
-        """Returns the projection data without the cutoff.
-        Args:
-            proj (torch.Tensor): Projection data
-            padded (bool, optional): Whether or not the projection data is padded. Defaults to True.
-        Returns:
-            torch.Tensor: Projection data without cutoff"""
-        if padded:
-            return proj * self.padded_mask
-        else:
-            return proj * self.mask
-
-class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
     def __init__(
         self,
         object_meta: ObjectMeta,
@@ -510,35 +420,3 @@ class MonteCarloHybridSPECTSystemMatrix(SPECTSystemMatrix):
         for transform in self.proj2proj_transforms:
             projections_total = transform.forward(projections_total, padded=False)
         return projections_total
-        
-class MonteCarloHybridSPECTPoissonLogLikelihood(PoissonLogLikelihood):
-    """Adapated Poisson log likelihood for Monte Carlo hybrid SPECT system matrix.
-    """
-    def compute_gradient(
-        self,
-        object: torch.Tensor,
-        subset_idx: int | None = None,
-        norm_BP_subset_method: str = 'subset_specific'
-        ) -> torch.Tensor:
-        """Returns the gradient of the log likelihood with respect to the object.
-        Args:
-            object (torch.Tensor): Object to simulate
-            subset_idx (int | None, optional): Index of the subset to use. If None, then all projections are used. Defaults to None.
-            norm_BP_subset_method (str, optional): Method to use for normalizing the back projection. Defaults to 'subset_specific'.
-        Returns:
-            torch.Tensor: Gradient of the log likelihood with respect to the object
-        """
-        proj_subset = self._get_projection_subset(self.projections, subset_idx)
-        additive_term_subset = self._get_projection_subset(self.additive_term, subset_idx)
-        self.projections_predicted = self.system_matrix.forward(object, subset_idx) + additive_term_subset
-        mask_bad = (self.projections_predicted < pytomography.delta)*(proj_subset > pytomography.delta)
-        ratio = (~mask_bad * proj_subset + pytomography.delta) / (self.projections_predicted + pytomography.delta)
-        ratio[ratio>1000] = 1000 # clip to prevent MC noise causing instability
-        norm_BP = self._get_normBP(subset_idx)
-        # Look for AdditiveTermTransform in System Matrix proj2proj transforms and update self.additive_term within that transform if estimate_background is true
-        for transform in self.system_matrix.proj2proj_transforms:
-            if isinstance(transform, AdditiveTermTransform):
-                transform.additive_term = transform.additive_term * ratio.sum() / (ratio*0+1).sum() 
-                print(f'Updated additive term to {transform.additive_term}')
-        #norm_BP = self.system_matrix.backward(mask, subset_idx)
-        return self.system_matrix.backward(ratio, subset_idx) - norm_BP
