@@ -888,10 +888,10 @@ def save_dcm(
     else:
         if single_dicom_file:
             # If single dicom file, will overwrite any file that is there
-            ds.save_as(os.path.join(save_path, f'{ds.SOPInstanceUID}.dcm'))
+            ds.save_as(os.path.join(save_path, f'{ds.SOPInstanceUID}.dcm'), little_endian=True, implicit_vr=True)
         else:
             for ds_i in dss:
-                ds_i.save_as(os.path.join(save_path, f'{ds_i.SOPInstanceUID}.dcm'))
+                ds_i.save_as(os.path.join(save_path, f'{ds_i.SOPInstanceUID}.dcm'), little_endian=True, implicit_vr=True)
                    
 # ---------------------------------------
 # Imaging System Specific Functions
@@ -1045,3 +1045,26 @@ def get_starguide_attenuation_map_from_CT_slices(
     CT = torch.tensor(CT).to(pytomography.dtype).to(pytomography.device)
     CT = torch.flip(CT, [2])
     return CT
+
+def print_energy_window_info(file_NM: str):
+    """A helper function to trints the energy window information for a given NM file.
+    Args:
+        file_NM (str): Filepath of the NM file
+    """
+    strs = []
+    windows = pydicom.dcmread(file_NM).EnergyWindowInformationSequence
+    for i, window in enumerate(windows):
+        if hasattr(window, 'EnergyWindowName'):
+            window_name = window.EnergyWindowName
+        else:
+            window_name = 'NoName'
+        range_sequences = window.EnergyWindowRangeSequence
+        range_sequence_strs = []
+        for range_sequence in range_sequences:
+            min_energy = range_sequence.EnergyWindowLowerLimit
+            max_energy = range_sequence.EnergyWindowUpperLimit
+            range_sequence_strs.append(f'[{min_energy}keV, {max_energy}keV]')
+        range_sequence_str = ', '.join(range_sequence_strs)
+        strs.append(f'Index {i}:   Name: "{window_name}", Energies: {range_sequence_str}')
+    for window_str in strs:
+        print(window_str)
