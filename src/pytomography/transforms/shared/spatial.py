@@ -18,7 +18,7 @@ class RotationTransform(Transform):
 		super(RotationTransform, self).__init__()
 		self.mode = mode
 				
-	@torch.no_grad()
+	#@torch.no_grad()
 	def forward(
 		self,
 		object: torch.Tensor,
@@ -35,7 +35,7 @@ class RotationTransform(Transform):
 		"""
 		return rotate(object.permute(2,0,1).unsqueeze(0), angles, mode=self.mode).squeeze().permute(1,2,0)
 
-	@torch.no_grad()
+	#@torch.no_grad()
 	def backward(
 		self,
 		object: torch.Tensor,

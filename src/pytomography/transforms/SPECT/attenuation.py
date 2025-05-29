@@ -69,7 +69,7 @@ class SPECTAttenuationTransform(Transform):
 		if self.filepath is not None:
 			self.attenuation_map = get_attenuation_map_from_CT_slices(self.filepath, proj_meta.filepath, proj_meta.index_peak, mode=self.mode, HU2mu_technique=self.HU2mu_technique)
 				
-	@torch.no_grad()
+	#@torch.no_grad()
 	def forward(
 		self,
 		object_i: torch.Tensor,
@@ -91,7 +91,7 @@ class SPECTAttenuationTransform(Transform):
 		norm_factor = get_prob_of_detection_matrix(rotate_detector_z(attenuation_map, self.proj_meta.angles[ang_idx]), self.object_meta.dx)
 		return object_i*norm_factor
 
-	@torch.no_grad()
+	#@torch.no_grad()
 	def backward(
 		self,
 		object_i: torch.Tensor,
@@ -114,7 +114,7 @@ class SPECTAttenuationTransform(Transform):
 		norm_factor = get_prob_of_detection_matrix(rotate_detector_z(attenuation_map, self.proj_meta.angles[ang_idx]), self.object_meta.dx)
 		return object_i*norm_factor
 
-	@torch.no_grad()
+	#@torch.no_grad()
 	def compute_average_prob_matrix(self):
 		attenuation_map = pad_object(self.attenuation_map)
 		average_norm_factor = torch.zeros(attenuation_map.shape).to(pytomography.device)
